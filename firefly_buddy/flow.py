@@ -121,7 +121,7 @@ def cancel_items(batch_id: str, item_ids: list[str] | None = None) -> list[str]:
     req = store.load_request(batch_id)
     if not req:
         raise KeyError(f"no such batch: {batch_id}")
-    wanted = set(item_ids) if item_ids else {it["id"] for it in req["items"]}
+    wanted = set(item_ids) if item_ids is not None else {it["id"] for it in req["items"]}
     unknown = wanted - {it["id"] for it in req["items"]}
     if unknown:
         raise KeyError(f"not in {batch_id}: {', '.join(sorted(unknown))}")

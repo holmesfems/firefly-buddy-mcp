@@ -12,7 +12,17 @@ from pathlib import Path
 
 MEDIA_EXT = {".wav", ".mp3", ".m4a", ".aac", ".ogg", ".flac", ".mp4", ".mov"}
 ARCHIVE_EXT = {".zip"}
-WATCH_EXT = MEDIA_EXT | ARCHIVE_EXT
+PICK_EXT = MEDIA_EXT | ARCHIVE_EXT   # what a human or Claude may hand over by hand
+DEFAULT_WATCH_EXT = {".wav"}         # Firefly's sound effects download as .wav
+
+
+def watch_ext() -> set[str]:
+    """Extensions picked up from Downloads (FIREFLY_BUDDY_WATCH_EXT=".wav,.zip" to widen)."""
+    env = os.environ.get("FIREFLY_BUDDY_WATCH_EXT")
+    if env:
+        exts = {"." + e.strip().lstrip(".").lower() for e in env.split(",") if e.strip()}
+        return (exts & PICK_EXT) or set(DEFAULT_WATCH_EXT)
+    return set(DEFAULT_WATCH_EXT)
 SAMPLE_RATE = 48000          # AK Studio mixes at 48 kHz and reads 16-bit PCM wav only
 TRIM_FILTER = "silenceremove=start_periods=1:start_threshold=-50dB:start_silence=0.005"
 
@@ -74,13 +84,16 @@ class DownloadWatcher:
 
     Files already there at the start, and files that arrive while nothing is being received
     (`accepting=False`), are never reported, so unrelated downloads are left alone.
-    Browsers write to a temporary name (.crdownload / .part) and rename at the end; only the
-    final name has a watched extension.
+    Only `exts` (default: .wav) are watched. Browsers write to a temporary name (.crdownload /
+    .part) and rename at the end; only the final name has a watched extension.
+    A name that leaves the folder (moved aside, deleted) is forgotten, so a later download that
+    reuses the name (the same Firefly take downloaded again) is picked up.
     """
 
-    def __init__(self, folder: Path, settle_polls: int = 2):
+    def __init__(self, folder: Path, settle_polls: int = 2, exts: set[str] | None = None):
         self.folder = Path(folder)
         self.settle_polls = settle_polls   # polls with an unchanged size before a file counts as done
+        self.exts = set(exts) if exts else watch_ext()
         self.seen: set[str] = set(self._names())
         self.sizes: dict[str, tuple[int, int]] = {}   # name -> (size, polls it has stayed that size)
 
@@ -90,17 +103,25 @@ class DownloadWatcher:
         except FileNotFoundError:
             return []
 
+    def forget(self, path: Path) -> None:
+        """Called after a file was moved out: the name may be reused by the next download."""
+        if not Path(path).exists():
+            self.seen.discard(Path(path).name)
+
     def poll(self, accepting: bool) -> list[Path]:
         ready: list[Path] = []
         try:
             entries = list(os.scandir(self.folder))
         except FileNotFoundError:
             return ready
+        present = {e.name for e in entries}
+        self.seen &= present                                   # forget names that left the folder
+        self.sizes = {k: v for k, v in self.sizes.items() if k in present}
         for e in entries:
             name = e.name
             if name in self.seen or not e.is_file():
                 continue
-            if Path(name).suffix.lower() not in WATCH_EXT:
+            if Path(name).suffix.lower() not in self.exts:
                 continue
             if not accepting:
                 self.seen.add(name)
@@ -158,15 +179,18 @@ def to_pcm16(src: Path, dst: Path, trim_silence: bool, ff: str) -> None:
 
 def _unzip_media(src: Path, into: Path) -> list[Path]:
     out = []
-    with zipfile.ZipFile(src) as z:
-        for info in z.infolist():
-            base = Path(info.filename).name          # flatten: never write outside `into`
-            if info.is_dir() or not base or Path(base).suffix.lower() not in MEDIA_EXT:
-                continue
-            target = unique_path(into, Path(base).stem, Path(base).suffix.lower())
-            with z.open(info) as fsrc, open(target, "wb") as fdst:
-                shutil.copyfileobj(fsrc, fdst)
-            out.append(target)
+    try:
+        with zipfile.ZipFile(src) as z:
+            for info in z.infolist():
+                base = Path(info.filename).name          # flatten: never write outside `into`
+                if info.is_dir() or not base or Path(base).suffix.lower() not in MEDIA_EXT:
+                    continue
+                target = unique_path(into, Path(base).stem, Path(base).suffix.lower())
+                with z.open(info) as fsrc, open(target, "wb") as fdst:
+                    shutil.copyfileobj(fsrc, fdst)
+                out.append(target)
+    except (zipfile.BadZipFile, zipfile.LargeZipFile, NotImplementedError, RuntimeError) as e:
+        raise IntakeError(f"{src.name} could not be opened as a zip: {e}") from e
     if not out:
         raise IntakeError(f"{src.name} has no audio or video inside")
     return out
@@ -211,23 +235,37 @@ def deliver(src: Path, dest_dir: Path, name: str, convert: str = "pcm16",
 
     out = {"files": [str(f) for f in files], "warnings": warnings}
     if keep_original_in is not None:
+        keep = Path(keep_original_in)
+        keep.mkdir(parents=True, exist_ok=True)
+        target = unique_path(keep, src.stem, src.suffix)   # chosen once, so retries never pile up copies
         for attempt in range(3):
-            if move_aside(src, Path(keep_original_in)):
+            if move_aside(src, target):
                 break
             time.sleep(0.2)
         else:  # still open in the browser or a virus scanner: the caller tries again later
-            out["pending_move"] = {"src": str(src), "keep": str(keep_original_in)}
+            out["pending_move"] = {"src": str(src), "target": str(target)}
     return out
 
 
-def move_aside(src: Path, keep: Path) -> bool:
-    """Move a picked-up download into `keep`. False while the file is still in use (Windows)."""
-    src = Path(src)
+def move_aside(src: Path, target: Path) -> bool:
+    """Move a picked-up download to `target`. False while it is still in use (Windows).
+
+    Tries a rename first (same drive). Across drives it copies to `target` once and then
+    removes `src`; a retry after a failed removal reuses that copy instead of making another.
+    """
+    src, target = Path(src), Path(target)
     if not src.exists():
         return True
-    keep.mkdir(parents=True, exist_ok=True)
+    target.parent.mkdir(parents=True, exist_ok=True)
     try:
-        shutil.move(str(src), str(unique_path(keep, src.stem, src.suffix)))
+        os.replace(src, target)
+        return True
+    except OSError:
+        pass
+    try:
+        if not target.exists() or target.stat().st_size != src.stat().st_size:
+            shutil.copy2(src, target)
+        os.remove(src)
         return True
     except OSError:
         return False

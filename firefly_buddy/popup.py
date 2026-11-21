@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import logging
 import sys
+import threading
 import time
 import webbrowser
 from pathlib import Path
@@ -86,11 +87,17 @@ class Controller:
         except (intake.IntakeError, KeyError, OSError) as e:
             self.messages.append(f"受け取れませんでした（{Path(path).name}）: {e}")
             return False
+        except Exception as e:  # noqa: BLE001 - one bad file must not stop the files after it
+            log.exception("receive failed: %s", path)
+            self.messages.append(f"受け取れませんでした（{Path(path).name}）: {type(e).__name__}: {e}")
+            return False
         names = ", ".join(Path(f).name for f in r["files"])
         self.messages.append(f"受け取りました: {names}")
         self.messages.extend(f"注意: {w}" for w in r["warnings"])
         if r.get("pending_move"):
             self.pending_moves.append({**r["pending_move"], "until": time.time() + self.MOVE_GIVE_UP})
+        elif from_downloads:
+            self.watcher.forget(Path(path))
         return True
 
     MOVE_GIVE_UP = 60.0   # seconds to keep trying to move an original out of Downloads
@@ -98,7 +105,8 @@ class Controller:
     def retry_moves(self) -> None:
         left = []
         for m in self.pending_moves:
-            if intake.move_aside(Path(m["src"]), Path(m["keep"])):
+            if intake.move_aside(Path(m["src"]), Path(m["target"])):
+                self.watcher.forget(Path(m["src"]))
                 continue
             if time.time() > m["until"]:
                 self.messages.append(f"元のファイルを移せなかったので、ダウンロードに残しています: {Path(m['src']).name}")
@@ -204,7 +212,7 @@ class App:
         from tkinter import filedialog
         path = filedialog.askopenfilename(
             title=f"{item['name']} のファイルを選ぶ", initialdir=str(self.ctl.watcher.folder),
-            filetypes=[("音声・動画", " ".join(f"*{e}" for e in sorted(intake.WATCH_EXT))), ("すべて", "*.*")])
+            filetypes=[("音声・動画", " ".join(f"*{e}" for e in sorted(intake.PICK_EXT))), ("すべて", "*.*")])
         if path:
             self.ctl.receive(item["id"], Path(path), from_downloads=False)
             self.refresh(force=True)
@@ -227,6 +235,7 @@ class App:
         self.refresh(force=True)
 
     def close(self) -> None:
+        _STOP.set()
         store.set_active(None)
         store.clear_heartbeat()
         self.root.destroy()
@@ -387,11 +396,27 @@ def main() -> None:
             pass
     store.touch_heartbeat()
     store.set_active(None)
+    beat = threading.Thread(target=_heartbeat, daemon=True)
+    beat.start()
     ctl = Controller(intake.DownloadWatcher(intake.downloads_dir()))
     try:
         App(ctl).run()
     finally:
+        _STOP.set()
         store.clear_heartbeat()
+
+
+_STOP = threading.Event()
+
+
+def _heartbeat() -> None:
+    """Touch popup.alive from a thread: a modal dialog (ファイルを選ぶ…) blocks the Tk loop, and the
+    server must not take the window for closed and open a second one meanwhile."""
+    while not _STOP.wait(1.0):
+        try:
+            store.touch_heartbeat()
+        except OSError:
+            pass
 
 
 if __name__ == "__main__":

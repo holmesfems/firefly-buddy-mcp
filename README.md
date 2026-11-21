@@ -22,7 +22,8 @@ Claude ── firefly_request_sfx（英語のプロンプトをまとめて）�
 Claude ── firefly_status で受け取りを確かめる
 ```
 
-- 窓は、項目のボタンを押した後に届いたファイルだけを拾う。それ以外のダウンロードには触らない。
+- 窓は、項目のボタンを押した後に届いた `.wav` だけを拾う（Firefly の効果音は `.wav` で落ちてくる）。それ以外のダウンロードには触らない。
+- 同じ中身のファイルは、同じ依頼の中で二度受け取らない（同じ案を二度落とした、受け取ったファイルを手で選び直した、など）。
 - 拾ったファイルの元（Firefly から落としたまま）は `~/.firefly-buddy-mcp/originals/<batch_id>/` に移す。
 - 拾い漏れたら、窓の「ファイルを選ぶ…」か、Claude の `firefly_attach` で渡せる。
 
@@ -79,6 +80,7 @@ ffmpeg は PATH にあればそれを、無ければ `imageio-ffmpeg` の同梱�
 |---|---|
 | `FIREFLY_BUDDY_HOME` | 依頼・結果を置く場所（既定 `~/.firefly-buddy-mcp`） |
 | `FIREFLY_BUDDY_DOWNLOADS` | 見張るフォルダ（既定は Windows の「ダウンロード」） |
+| `FIREFLY_BUDDY_WATCH_EXT` | 見張る拡張子（既定 `.wav`。例 `.wav,.zip`。音声・動画・zip 以外は無視） |
 | `FIREFLY_BUDDY_FFMPEG` | ffmpeg の場所 |
 
 ## テスト
