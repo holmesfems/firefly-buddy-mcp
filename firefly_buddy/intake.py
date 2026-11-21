@@ -142,6 +142,52 @@ class DownloadWatcher:
         return ready
 
 
+# ---------------------------------------------------------------- length
+
+FIREFLY_MIN_SECONDS, FIREFLY_MAX_SECONDS = 1.0, 30.0   # the Duration slider: 1-30 s in 0.1 s steps
+LENGTH_SLACK = 0.3                                      # Firefly makes takes of the set length
+
+
+def firefly_seconds(duration: float) -> float:
+    """What Firefly's Duration slider can be set to for `duration` (0.1 s steps, 1-30 s)."""
+    return min(FIREFLY_MAX_SECONDS, max(FIREFLY_MIN_SECONDS, round(float(duration), 1)))
+
+
+def media_seconds(path: Path) -> float | None:
+    """Length of an audio/video file in seconds (None when it cannot be read)."""
+    path = Path(path)
+    try:
+        import wave
+        with wave.open(str(path)) as w:
+            return w.getnframes() / float(w.getframerate())
+    except Exception:  # noqa: BLE001 - not a plain PCM wav: ask ffmpeg
+        pass
+    ff = ffmpeg_exe()
+    if not ff:
+        return None
+    r = subprocess.run([ff, "-hide_banner", "-i", str(path)], capture_output=True,
+                       creationflags=_no_window())
+    m = re.search(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)", r.stderr.decode("utf-8", "replace"))
+    if not m:
+        return None
+    h, mi, s = m.groups()
+    return int(h) * 3600 + int(mi) * 60 + float(s)
+
+
+def length_warning(seconds: float | None, duration: float | None) -> str | None:
+    """A note for the human and Claude when a take is not as long as asked (it is still received).
+    Compared with what the slider can be set to (firefly_seconds), with LENGTH_SLACK of slack."""
+    if seconds is None or not duration:
+        return None
+    want = firefly_seconds(duration)
+    if abs(seconds - want) <= LENGTH_SLACK:
+        return None
+    msg = f"長さが {seconds:.1f} 秒でした（頼んだ Duration は {want:g} 秒）。"
+    if abs(seconds - 8.0) <= LENGTH_SLACK:
+        return msg + "Firefly の Duration が既定の 8 秒のままだったかもしれません"
+    return msg + "Firefly の Duration の設定を確かめてください"
+
+
 # ---------------------------------------------------------------- delivering
 
 _BAD = re.compile(r'[<>:"/\\|?*\x00-\x1f]')

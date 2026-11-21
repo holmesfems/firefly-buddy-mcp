@@ -100,6 +100,16 @@ class Controller:
             self.watcher.forget(Path(path))
         return True
 
+    def unreceive(self, item_id: str, path: str) -> bool:
+        try:
+            r = flow.unreceive(item_id, path)
+        except (KeyError, OSError) as e:
+            self.messages.append(f"取り消せませんでした（{Path(path).name}）: {e}")
+            return False
+        self.messages.append(f"受け取りを取り消しました: {Path(path).name}（元のファイルは残っています）")
+        self.messages.extend(f"注意: {w}" for w in r["warnings"])
+        return True
+
     MOVE_GIVE_UP = 60.0   # seconds to keep trying to move an original out of Downloads
 
     def retry_moves(self) -> None:
@@ -224,6 +234,14 @@ class App:
             var.set("")
         self.refresh(force=True)
 
+    def unreceive(self, item: dict, path: str) -> None:
+        from tkinter import messagebox
+        if messagebox.askyesno("受け取りの取り消し",
+                               f"{Path(path).name} の受け取りを取り消して、このファイルを消しますか？\n"
+                               "（Firefly から落とした元のファイルは残ります）", parent=self.root):
+            self.ctl.unreceive(item["id"], path)
+            self.refresh(force=True)
+
     def send_feedback(self, item: dict) -> None:
         var = self.fb_vars.get(item["id"])
         if var and self.ctl.feedback(item["id"], var.get()):
@@ -303,16 +321,28 @@ class App:
         tk.Label(frame, text=item["prompt"], background=bg, foreground="#246", font=self.mono,
                  wraplength=self.wrap - 40, justify="left").pack(anchor="w", padx=8, pady=(2, 4))
         if item.get("duration"):
-            tk.Label(frame, text=f"Duration を {item['duration']:g} 秒に（Firefly の既定は 8 秒）",
+            slider = intake.firefly_seconds(item["duration"])
+            extra = f"。使う長さは {item['duration']:g} 秒" if abs(slider - item["duration"]) > 0.05 else ""
+            tk.Label(frame, text=f"Duration を {slider:g} 秒に（Firefly の既定は 8 秒{extra}）",
                      background=bg, font=self.bold, foreground="#a50").pack(anchor="w", padx=8)
         else:
             tk.Label(frame, text="Duration の指定なし（Firefly の既定は 8 秒。短い音なら縮めてください）",
                      background=bg, foreground="#a50").pack(anchor="w", padx=8)
         if item.get("dest_dir"):
-            tk.Label(frame, text=f"入れる先: {item['dest_dir']}", background=bg, foreground="#888").pack(
-                anchor="w", padx=8)
+            tk.Label(frame, text=f"入れる先: {item['dest_dir']}", background=bg, foreground="#888",
+                     wraplength=self.wrap - 40, justify="left").pack(anchor="w", padx=8)
+        info = flow.takes(st)
         for f in st["files"]:
-            tk.Label(frame, text=f"✓ {Path(f).name}", background=bg, foreground="#0a5").pack(anchor="w", padx=8)
+            t = info.get(f, {})
+            line = tk.Frame(frame, background=bg)
+            line.pack(fill="x", padx=8)
+            secs = f"（{t['seconds']:.1f} 秒）" if t.get("seconds") is not None else ""
+            tk.Label(line, text=f"✓ {Path(f).name}{secs}", background=bg, foreground="#0a5").pack(side="left")
+            ttk.Button(line, text="取り消す", command=lambda it=item, p=f: self.unreceive(it, p)).pack(
+                side="left", padx=6)
+            for w in t.get("warnings", []):
+                tk.Label(frame, text=f"⚠ {w}", background=bg, foreground="#c60", wraplength=self.wrap - 40,
+                         justify="left").pack(anchor="w", padx=24)
         if st.get("error"):
             tk.Label(frame, text=f"× {st['error']}", background=bg, foreground="#c33",
                      wraplength=self.wrap - 40, justify="left").pack(anchor="w", padx=8)

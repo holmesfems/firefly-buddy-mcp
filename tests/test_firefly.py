@@ -258,6 +258,28 @@ class DeliverTests(Base):
         self.assertFalse(src.exists())
         self.assertEqual(sorted(p.name for p in target.parent.iterdir()), ["locked.wav"])
 
+    def test_firefly_seconds_follow_the_slider(self):
+        cases = {0.3: 1.0, 0.8: 1.0, 1.0: 1.0, 1.26: 1.3, 2.04: 2.0, 30: 30.0, 45: 30.0}
+        for asked, slider in cases.items():
+            with self.subTest(asked=asked):
+                self.assertEqual(intake.firefly_seconds(asked), slider)
+
+    def test_length_warning(self):
+        self.assertIsNone(intake.length_warning(1.0, 0.8))          # shorter than 1 s is made as 1 s
+        self.assertIsNone(intake.length_warning(1.2, 1.0))          # within 0.3 s
+        self.assertIsNone(intake.length_warning(None, 1.0))
+        self.assertIsNone(intake.length_warning(8.0, None))
+        self.assertIn("8 秒のまま", intake.length_warning(8.0, 1.0))
+        w = intake.length_warning(1.5, 1.0)
+        self.assertIn("1.5 秒", w)
+        self.assertNotIn("8 秒のまま", w)
+
+    def test_media_seconds(self):
+        self.assertAlmostEqual(intake.media_seconds(write_wav(self.root / "a.wav", seconds=0.5)), 0.5, places=2)
+        junk = self.root / "junk.wav"
+        junk.write_bytes(b"nope")
+        self.assertIsNone(intake.media_seconds(junk))
+
     def test_rejects_non_media(self):
         f = self.root / "x.txt"
         f.write_text("x")
@@ -421,6 +443,45 @@ class ControllerTests(Base):
             asyncio.run(server.firefly_attach(iid, str(z)))
         self.assertIn("zip", str(cm.exception))
         self.assertIn("zip", store.load_results(self.r["batch_id"])["items"][iid]["error"])
+
+    def test_take_of_the_wrong_length_is_received_with_a_note(self):
+        r = self.request(self.item(name="hit", duration=1, convert="none"))
+        iid = r["items"][0]["id"]
+        out = flow.receive_file(iid, write_wav(self.root / "long.wav", seconds=2.0), from_downloads=False)
+        self.assertTrue(any("2.0 秒" in w for w in out["warnings"]))
+        flow.receive_file(iid, write_wav(self.root / "ok.wav", seconds=1.0), from_downloads=False)
+        row = asyncio.run(server.firefly_status(r["batch_id"]))["batches"][0]["items"][0]
+        self.assertEqual(row["status"], "received")
+        self.assertEqual(row["seconds"], {"hit.wav": 2.0, "hit_2.wav": 1.0})
+        self.assertEqual(len(row["warnings"]), 1)
+        flow.unreceive(iid, row["files"][0])                     # taking it back drops its note
+        row = asyncio.run(server.firefly_status(r["batch_id"]))["batches"][0]["items"][0]
+        self.assertNotIn("warnings", row)
+
+    def test_unreceive_deletes_the_copy_and_allows_the_file_again(self):
+        iid = self.r["items"][0]["id"]
+        src = write_wav(self.root / "take.wav")
+        got = flow.receive_file(iid, src, from_downloads=False)["files"][0]
+        out = flow.unreceive(iid, got)
+        self.assertEqual(out["status"], "waiting")
+        self.assertFalse(Path(got).exists())
+        self.assertTrue(src.exists())                            # the original is kept
+        st = store.load_results(self.r["batch_id"])["items"][iid]
+        self.assertEqual((st["files"], st["received"]), ([], []))
+        again = flow.receive_file(iid, src, from_downloads=False)  # no longer a duplicate
+        self.assertEqual(len(again["files"]), 1)
+        with self.assertRaises(KeyError):
+            flow.unreceive(iid, str(self.root / "never.wav"))
+
+    def test_unreceive_one_of_two_keeps_the_item_received(self):
+        iid = self.r["items"][0]["id"]
+        a = flow.receive_file(iid, write_wav(self.root / "a.wav"), from_downloads=False)["files"][0]
+        flow.receive_file(iid, write_wav(self.root / "b.wav", seconds=0.3), from_downloads=False)
+        self.assertTrue(self.ctl.unreceive(iid, a))
+        st = store.load_results(self.r["batch_id"])["items"][iid]
+        self.assertEqual(st["status"], "received")
+        self.assertEqual(len(st["files"]), 1)
+        self.assertFalse(self.ctl.unreceive(iid, a))             # already gone: reported, no crash
 
     def test_cancelled_item_refuses_files(self):
         iid = self.r["items"][1]["id"]
