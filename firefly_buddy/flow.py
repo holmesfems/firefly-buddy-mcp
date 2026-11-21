@@ -55,6 +55,10 @@ def receive_file(item_id: str, path: Path, from_downloads: bool) -> dict:
     if dup:
         raise DuplicateFile(Path(path), *dup)
     keep = store.originals_dir() / req["batch_id"] if from_downloads else None
+    seconds = None
+    if Path(path).suffix.lower() in intake.MEDIA_EXT:   # measured before conversion trims the start
+        seconds = intake.media_seconds(Path(path))
+    length_note = intake.length_warning(seconds, item.get("duration"))
     try:
         r = intake.deliver(Path(path), dest_for(req, item), item["name"],
                            item.get("convert", "pcm16"), item.get("trim_silence", True), keep)
@@ -65,17 +69,65 @@ def receive_file(item_id: str, path: Path, from_downloads: bool) -> dict:
         raise
 
     outputs = [file_hash(Path(f)) for f in r["files"]]
+    rec = {"source": digest, "outputs": outputs, "files": r["files"]}
+    if seconds is not None:
+        rec["seconds"] = round(seconds, 2)
+    if length_note:
+        rec["warnings"] = [length_note]
+        r["warnings"] = r["warnings"] + [length_note]
 
     def record(res):
         s = store.item_state(res, item_id)
         s["status"] = store.RECEIVED
         s["files"] = s["files"] + r["files"]
-        s["received"] = s.get("received", []) + [{"source": digest, "outputs": outputs, "files": r["files"]}]
-        s["warnings"] = sorted(set(s.get("warnings", []) + r["warnings"]))
+        s["received"] = s.get("received", []) + [rec]
+        s["warnings"] = sorted(set(s.get("warnings", []) + [w for w in r["warnings"] if w != length_note]))
         s.pop("error", None)
         s["updated"] = store.now_iso()
     store.update_results(req["batch_id"], record)
     return r
+
+
+def takes(st: dict) -> dict[str, dict]:
+    """file -> {"seconds": .., "warnings": [..]} for the files an item received."""
+    out = {}
+    for rec in st.get("received", []):
+        for f in rec.get("files", []):
+            out[f] = {"seconds": rec.get("seconds"), "warnings": rec.get("warnings", [])}
+    return out
+
+
+def unreceive(item_id: str, file: str) -> dict:
+    """Take back one received file: forget it (so the same download can be received again) and
+    delete the delivered copy. The original stays in originals/<batch>/ (or wherever it was).
+    An item left with no files goes back to waiting."""
+    target = str(Path(file))
+
+    def drop(res):
+        s = store.item_state(res, item_id)
+        if target not in s["files"]:
+            raise KeyError(f"{Path(file).name} is not a file received for {item_id}")
+        s["files"] = [f for f in s["files"] if f != target]
+        kept = []
+        for rec in s.get("received", []):
+            if target in rec.get("files", []):
+                i = rec["files"].index(target)
+                rec = {**rec, "files": rec["files"][:i] + rec["files"][i + 1:],
+                       "outputs": [o for j, o in enumerate(rec.get("outputs", [])) if j != i]}
+                if not rec["files"]:
+                    continue
+            kept.append(rec)
+        s["received"] = kept
+        if not s["files"] and s["status"] == store.RECEIVED:
+            s["status"] = store.WAITING
+        s["updated"] = store.now_iso()
+    res = store.update_results(store.batch_of(item_id), drop)
+    warnings = []
+    try:
+        Path(target).unlink(missing_ok=True)
+    except OSError as e:
+        warnings.append(f"could not delete {Path(target).name}: {e}")
+    return {"removed": target, "status": store.item_state(res, item_id)["status"], "warnings": warnings}
 
 
 def _append_feedback(s: dict, text: str) -> None:
@@ -121,7 +173,7 @@ def cancel_items(batch_id: str, item_ids: list[str] | None = None) -> list[str]:
     req = store.load_request(batch_id)
     if not req:
         raise KeyError(f"no such batch: {batch_id}")
-    wanted = set(item_ids) if item_ids else {it["id"] for it in req["items"]}
+    wanted = set(item_ids) if item_ids is not None else {it["id"] for it in req["items"]}
     unknown = wanted - {it["id"] for it in req["items"]}
     if unknown:
         raise KeyError(f"not in {batch_id}: {', '.join(sorted(unknown))}")

@@ -54,7 +54,10 @@ Claude は Firefly を直接操作しない（API が無く、規約で自動操
   否定（"no rumble"）は効きにくく、かえってその音が入ることがあるので、欲しい音を肯定で書く。
   Firefly の画面の助言は「短く具体的に、音の 1 つの要素に絞る」。
 - duration（秒）は必ず付ける。Firefly の Duration は既定が 8 秒で、そのままだと一発の音も 8 秒に引き伸ばされて地鳴りになる。
-  窓に「Duration を ◯ 秒に」と出るので、人間がスライダーを合わせる。prompt にも "about 0.8 seconds" のように書く。
+  スライダーは 1〜30 秒・0.1 秒刻み（1 秒より短い音は 1 秒で作られる）。窓に「Duration を ◯ 秒に」と出るので人間が合わせる。
+  prompt にも "about 1 second" のように書く。
+- 届いた案の長さ（Firefly が作ったままの秒数）は firefly_status の seconds に出る。Duration と 0.3 秒以上ずれた案は
+  受け取ったうえで warnings に注意が付く（スライダーの合わせ忘れのことが多い）。窓では人間が受け取りを取り消せる。
 - Firefly には参考のファイルを渡す欄は無い（Audio guide はマイクで録音して、タイミングと音量の目安にするもの）。
   リズムや形が大事な音なら、note に「声でこうまねて録音すると良い」と書いてもよい。
 - note は日本語で、何に使うか・どんな音なら当たりかを人間向けに一言（例:「章タイトルのドン。重く短く」）。
@@ -79,8 +82,9 @@ class SfxItem(BaseModel):
     convert: Literal["pcm16", "none"] = Field(
         "pcm16", description="pcm16: 16-bit PCM 48 kHz wav (AK Studio reads only this). none: keep Firefly's file.")
     trim_silence: bool = Field(True, description="Cut silence at the start (pcm16 only).")
-    duration: float | None = Field(None, gt=0, le=60, description="Length in seconds. Always give it: Firefly's "
-                                   "Duration slider defaults to 8 s. Shown on the window; say it in the prompt too.")
+    duration: float | None = Field(None, gt=0, le=30, description="Length in seconds. Always give it: Firefly's "
+                                   "Duration slider (1-30 s, 0.1 s steps) defaults to 8 s. Shown on the window; "
+                                   "say it in the prompt too.")
 
 
 def check_items(items: list[SfxItem]) -> None:
@@ -131,11 +135,17 @@ def describe_batch(batch_id: str) -> dict:
     for it in req["items"]:
         st = store.item_state(res, it["id"])
         row = {"id": it["id"], "name": it["name"], "status": st["status"], "files": st["files"]}
+        tk = flow.takes(st)
+        secs = {Path(f).name: t["seconds"] for f, t in tk.items() if t["seconds"] is not None}
+        if secs:
+            row["seconds"] = secs          # length of each take as Firefly made it (before trimming)
         if st.get("feedback"):
             row["feedback"] = [fb["text"] for fb in st["feedback"]]
-        for k in ("warnings", "error"):
-            if st.get(k):
-                row[k] = st[k]
+        warnings = list(st.get("warnings", [])) + [w for t in tk.values() for w in t["warnings"]]
+        if warnings:
+            row["warnings"] = warnings
+        if st.get("error"):
+            row["error"] = st["error"]
         items.append(row)
     return {"batch_id": batch_id, "title": req.get("title", ""), "created": req.get("created"),
             "pending": store.pending_count(req, res), "items": items}

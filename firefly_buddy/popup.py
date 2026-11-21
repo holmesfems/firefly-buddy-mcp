@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import logging
 import sys
+import threading
 import time
 import webbrowser
 from pathlib import Path
@@ -86,11 +87,27 @@ class Controller:
         except (intake.IntakeError, KeyError, OSError) as e:
             self.messages.append(f"受け取れませんでした（{Path(path).name}）: {e}")
             return False
+        except Exception as e:  # noqa: BLE001 - one bad file must not stop the files after it
+            log.exception("receive failed: %s", path)
+            self.messages.append(f"受け取れませんでした（{Path(path).name}）: {type(e).__name__}: {e}")
+            return False
         names = ", ".join(Path(f).name for f in r["files"])
         self.messages.append(f"受け取りました: {names}")
         self.messages.extend(f"注意: {w}" for w in r["warnings"])
         if r.get("pending_move"):
             self.pending_moves.append({**r["pending_move"], "until": time.time() + self.MOVE_GIVE_UP})
+        elif from_downloads:
+            self.watcher.forget(Path(path))
+        return True
+
+    def unreceive(self, item_id: str, path: str) -> bool:
+        try:
+            r = flow.unreceive(item_id, path)
+        except (KeyError, OSError) as e:
+            self.messages.append(f"取り消せませんでした（{Path(path).name}）: {e}")
+            return False
+        self.messages.append(f"受け取りを取り消しました: {Path(path).name}（元のファイルは残っています）")
+        self.messages.extend(f"注意: {w}" for w in r["warnings"])
         return True
 
     MOVE_GIVE_UP = 60.0   # seconds to keep trying to move an original out of Downloads
@@ -98,7 +115,8 @@ class Controller:
     def retry_moves(self) -> None:
         left = []
         for m in self.pending_moves:
-            if intake.move_aside(Path(m["src"]), Path(m["keep"])):
+            if intake.move_aside(Path(m["src"]), Path(m["target"])):
+                self.watcher.forget(Path(m["src"]))
                 continue
             if time.time() > m["until"]:
                 self.messages.append(f"元のファイルを移せなかったので、ダウンロードに残しています: {Path(m['src']).name}")
@@ -204,7 +222,7 @@ class App:
         from tkinter import filedialog
         path = filedialog.askopenfilename(
             title=f"{item['name']} のファイルを選ぶ", initialdir=str(self.ctl.watcher.folder),
-            filetypes=[("音声・動画", " ".join(f"*{e}" for e in sorted(intake.WATCH_EXT))), ("すべて", "*.*")])
+            filetypes=[("音声・動画", " ".join(f"*{e}" for e in sorted(intake.PICK_EXT))), ("すべて", "*.*")])
         if path:
             self.ctl.receive(item["id"], Path(path), from_downloads=False)
             self.refresh(force=True)
@@ -215,6 +233,14 @@ class App:
         if var:
             var.set("")
         self.refresh(force=True)
+
+    def unreceive(self, item: dict, path: str) -> None:
+        from tkinter import messagebox
+        if messagebox.askyesno("受け取りの取り消し",
+                               f"{Path(path).name} の受け取りを取り消して、このファイルを消しますか？\n"
+                               "（Firefly から落とした元のファイルは残ります）", parent=self.root):
+            self.ctl.unreceive(item["id"], path)
+            self.refresh(force=True)
 
     def send_feedback(self, item: dict) -> None:
         var = self.fb_vars.get(item["id"])
@@ -227,6 +253,7 @@ class App:
         self.refresh(force=True)
 
     def close(self) -> None:
+        _STOP.set()
         store.set_active(None)
         store.clear_heartbeat()
         self.root.destroy()
@@ -294,16 +321,28 @@ class App:
         tk.Label(frame, text=item["prompt"], background=bg, foreground="#246", font=self.mono,
                  wraplength=self.wrap - 40, justify="left").pack(anchor="w", padx=8, pady=(2, 4))
         if item.get("duration"):
-            tk.Label(frame, text=f"Duration を {item['duration']:g} 秒に（Firefly の既定は 8 秒）",
+            slider = intake.firefly_seconds(item["duration"])
+            extra = f"。使う長さは {item['duration']:g} 秒" if abs(slider - item["duration"]) > 0.05 else ""
+            tk.Label(frame, text=f"Duration を {slider:g} 秒に（Firefly の既定は 8 秒{extra}）",
                      background=bg, font=self.bold, foreground="#a50").pack(anchor="w", padx=8)
         else:
             tk.Label(frame, text="Duration の指定なし（Firefly の既定は 8 秒。短い音なら縮めてください）",
                      background=bg, foreground="#a50").pack(anchor="w", padx=8)
         if item.get("dest_dir"):
-            tk.Label(frame, text=f"入れる先: {item['dest_dir']}", background=bg, foreground="#888").pack(
-                anchor="w", padx=8)
+            tk.Label(frame, text=f"入れる先: {item['dest_dir']}", background=bg, foreground="#888",
+                     wraplength=self.wrap - 40, justify="left").pack(anchor="w", padx=8)
+        info = flow.takes(st)
         for f in st["files"]:
-            tk.Label(frame, text=f"✓ {Path(f).name}", background=bg, foreground="#0a5").pack(anchor="w", padx=8)
+            t = info.get(f, {})
+            line = tk.Frame(frame, background=bg)
+            line.pack(fill="x", padx=8)
+            secs = f"（{t['seconds']:.1f} 秒）" if t.get("seconds") is not None else ""
+            tk.Label(line, text=f"✓ {Path(f).name}{secs}", background=bg, foreground="#0a5").pack(side="left")
+            ttk.Button(line, text="取り消す", command=lambda it=item, p=f: self.unreceive(it, p)).pack(
+                side="left", padx=6)
+            for w in t.get("warnings", []):
+                tk.Label(frame, text=f"⚠ {w}", background=bg, foreground="#c60", wraplength=self.wrap - 40,
+                         justify="left").pack(anchor="w", padx=24)
         if st.get("error"):
             tk.Label(frame, text=f"× {st['error']}", background=bg, foreground="#c33",
                      wraplength=self.wrap - 40, justify="left").pack(anchor="w", padx=8)
@@ -387,11 +426,27 @@ def main() -> None:
             pass
     store.touch_heartbeat()
     store.set_active(None)
+    beat = threading.Thread(target=_heartbeat, daemon=True)
+    beat.start()
     ctl = Controller(intake.DownloadWatcher(intake.downloads_dir()))
     try:
         App(ctl).run()
     finally:
+        _STOP.set()
         store.clear_heartbeat()
+
+
+_STOP = threading.Event()
+
+
+def _heartbeat() -> None:
+    """Touch popup.alive from a thread: a modal dialog (ファイルを選ぶ…) blocks the Tk loop, and the
+    server must not take the window for closed and open a second one meanwhile."""
+    while not _STOP.wait(1.0):
+        try:
+            store.touch_heartbeat()
+        except OSError:
+            pass
 
 
 if __name__ == "__main__":

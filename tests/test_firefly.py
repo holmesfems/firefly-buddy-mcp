@@ -111,6 +111,12 @@ class RequestTests(Base):
         self.assertLess(time.monotonic() - t0, 10)
         self.assertEqual(st["batches"][0]["items"][0]["status"], "skipped")
 
+    def test_cancel_with_empty_list_cancels_nothing(self):
+        r = self.request(self.item(), self.item(name="b"))
+        self.assertEqual(flow.cancel_items(r["batch_id"], []), [])
+        st = asyncio.run(server.firefly_status(r["batch_id"]))["batches"][0]
+        self.assertEqual(st["pending"], 2)
+
     def test_cancel_only_touches_waiting_items(self):
         r = self.request(self.item(), self.item(name="b"))
         flow.skip_item(r["items"][0]["id"])
@@ -155,10 +161,42 @@ class WatcherTests(Base):
 
     def test_files_arriving_while_idle_are_left_alone(self):
         w = intake.DownloadWatcher(self.downloads)
-        (self.downloads / "unrelated.mp3").write_bytes(b"x" * 10)
+        (self.downloads / "unrelated.wav").write_bytes(b"x" * 10)
         self.assertEqual(w.poll(False), [])
         self.assertEqual(w.poll(True), [])
         self.assertEqual(w.poll(True), [])
+
+
+    def poll_until_ready(self, w, n=3):
+        out = []
+        for _ in range(n):
+            out += w.poll(True)
+        return out
+
+    def test_only_wav_by_default(self):
+        w = intake.DownloadWatcher(self.downloads)
+        for name in ("clip.mp4", "song.mp3", "pack.zip", "take.WAV"):
+            (self.downloads / name).write_bytes(b"x" * 10)
+        self.assertEqual([p.name for p in self.poll_until_ready(w)], ["take.WAV"])
+
+    def test_watch_ext_can_be_widened(self):
+        with mock.patch.dict(os.environ, {"FIREFLY_BUDDY_WATCH_EXT": "wav, .ZIP, exe"}):
+            self.assertEqual(intake.watch_ext(), {".wav", ".zip"})     # unknown types are dropped
+            w = intake.DownloadWatcher(self.downloads)
+        (self.downloads / "pack.zip").write_bytes(b"x" * 10)
+        self.assertEqual([p.name for p in self.poll_until_ready(w)], ["pack.zip"])
+        with mock.patch.dict(os.environ, {"FIREFLY_BUDDY_WATCH_EXT": "exe"}):
+            self.assertEqual(intake.watch_ext(), {".wav"})
+
+    def test_a_name_that_left_the_folder_can_come_back(self):
+        w = intake.DownloadWatcher(self.downloads)
+        f = self.downloads / "take.wav"
+        f.write_bytes(b"x" * 10)
+        self.assertEqual(len(self.poll_until_ready(w)), 1)
+        f.unlink()                                               # moved aside after receiving
+        w.poll(True)
+        f.write_bytes(b"y" * 12)                                 # same take downloaded again
+        self.assertEqual([p.name for p in self.poll_until_ready(w)], ["take.wav"])
 
 
 class DeliverTests(Base):
@@ -195,6 +233,52 @@ class DeliverTests(Base):
         self.assertEqual(Path(r["files"][0]).name, "boom_2.wav")
         self.assertFalse(src.exists())
         self.assertTrue((self.root / "orig" / "Firefly take.wav").exists())
+
+    def test_broken_zip_is_an_intake_error(self):
+        z = self.root / "broken.zip"
+        z.write_bytes(b"PK not really a zip")
+        with self.assertRaises(intake.IntakeError):
+            intake.deliver(z, self.root / "out", "x")
+
+    def test_move_aside_copies_once_while_the_original_is_locked(self):
+        src = write_wav(self.downloads / "locked.wav")
+        target = self.root / "orig" / "locked.wav"
+        real_remove = os.remove
+        calls = {"n": 0}
+
+        def flaky_remove(p):
+            calls["n"] += 1
+            if calls["n"] <= 3:
+                raise PermissionError(32, "in use")
+            real_remove(p)
+        with mock.patch.object(intake.os, "replace", side_effect=OSError("other drive")),                 mock.patch.object(intake.os, "remove", side_effect=flaky_remove):
+            for _ in range(3):
+                self.assertFalse(intake.move_aside(src, target))
+            self.assertTrue(intake.move_aside(src, target))
+        self.assertFalse(src.exists())
+        self.assertEqual(sorted(p.name for p in target.parent.iterdir()), ["locked.wav"])
+
+    def test_firefly_seconds_follow_the_slider(self):
+        cases = {0.3: 1.0, 0.8: 1.0, 1.0: 1.0, 1.26: 1.3, 2.04: 2.0, 30: 30.0, 45: 30.0}
+        for asked, slider in cases.items():
+            with self.subTest(asked=asked):
+                self.assertEqual(intake.firefly_seconds(asked), slider)
+
+    def test_length_warning(self):
+        self.assertIsNone(intake.length_warning(1.0, 0.8))          # shorter than 1 s is made as 1 s
+        self.assertIsNone(intake.length_warning(1.2, 1.0))          # within 0.3 s
+        self.assertIsNone(intake.length_warning(None, 1.0))
+        self.assertIsNone(intake.length_warning(8.0, None))
+        self.assertIn("8 秒のまま", intake.length_warning(8.0, 1.0))
+        w = intake.length_warning(1.5, 1.0)
+        self.assertIn("1.5 秒", w)
+        self.assertNotIn("8 秒のまま", w)
+
+    def test_media_seconds(self):
+        self.assertAlmostEqual(intake.media_seconds(write_wav(self.root / "a.wav", seconds=0.5)), 0.5, places=2)
+        junk = self.root / "junk.wav"
+        junk.write_bytes(b"nope")
+        self.assertIsNone(intake.media_seconds(junk))
 
     def test_rejects_non_media(self):
         f = self.root / "x.txt"
@@ -254,7 +338,7 @@ class ControllerTests(Base):
     def test_gives_up_moving_after_a_while(self):
         f = self.downloads / "stuck.wav"
         write_wav(f)
-        self.ctl.pending_moves.append({"src": str(f), "keep": str(self.root / "keep"), "until": 0})
+        self.ctl.pending_moves.append({"src": str(f), "target": str(self.root / "keep" / "stuck.wav"), "until": 0})
         with mock.patch.object(intake, "move_aside", return_value=False):
             self.ctl.tick()
         self.assertEqual(self.ctl.pending_moves, [])
@@ -340,6 +424,64 @@ class ControllerTests(Base):
         self.assertEqual(len(st["files"]), 1)
         self.assertTrue((self.downloads / "take (1).wav").exists())
         self.assertTrue(any("飛ばしました" in m for m in self.ctl.messages))
+
+    def test_same_name_downloaded_again_is_received(self):
+        iid = self.r["items"][0]["id"]
+        self.ctl.activate(iid)
+        write_wav(self.downloads / "Firefly_audio_variation1.wav")
+        self.settle()
+        write_wav(self.downloads / "Firefly_audio_variation1.wav", seconds=0.3)   # regenerated take
+        self.settle()
+        st = store.load_results(self.r["batch_id"])["items"][iid]
+        self.assertEqual([Path(f).name for f in st["files"]], ["slam_hit.wav", "slam_hit_2.wav"])
+
+    def test_broken_zip_by_hand_reports_why(self):
+        z = self.root / "broken.zip"
+        z.write_bytes(b"not a zip")
+        iid = self.r["items"][0]["id"]
+        with self.assertRaises(Exception) as cm:
+            asyncio.run(server.firefly_attach(iid, str(z)))
+        self.assertIn("zip", str(cm.exception))
+        self.assertIn("zip", store.load_results(self.r["batch_id"])["items"][iid]["error"])
+
+    def test_take_of_the_wrong_length_is_received_with_a_note(self):
+        r = self.request(self.item(name="hit", duration=1, convert="none"))
+        iid = r["items"][0]["id"]
+        out = flow.receive_file(iid, write_wav(self.root / "long.wav", seconds=2.0), from_downloads=False)
+        self.assertTrue(any("2.0 秒" in w for w in out["warnings"]))
+        flow.receive_file(iid, write_wav(self.root / "ok.wav", seconds=1.0), from_downloads=False)
+        row = asyncio.run(server.firefly_status(r["batch_id"]))["batches"][0]["items"][0]
+        self.assertEqual(row["status"], "received")
+        self.assertEqual(row["seconds"], {"hit.wav": 2.0, "hit_2.wav": 1.0})
+        self.assertEqual(len(row["warnings"]), 1)
+        flow.unreceive(iid, row["files"][0])                     # taking it back drops its note
+        row = asyncio.run(server.firefly_status(r["batch_id"]))["batches"][0]["items"][0]
+        self.assertNotIn("warnings", row)
+
+    def test_unreceive_deletes_the_copy_and_allows_the_file_again(self):
+        iid = self.r["items"][0]["id"]
+        src = write_wav(self.root / "take.wav")
+        got = flow.receive_file(iid, src, from_downloads=False)["files"][0]
+        out = flow.unreceive(iid, got)
+        self.assertEqual(out["status"], "waiting")
+        self.assertFalse(Path(got).exists())
+        self.assertTrue(src.exists())                            # the original is kept
+        st = store.load_results(self.r["batch_id"])["items"][iid]
+        self.assertEqual((st["files"], st["received"]), ([], []))
+        again = flow.receive_file(iid, src, from_downloads=False)  # no longer a duplicate
+        self.assertEqual(len(again["files"]), 1)
+        with self.assertRaises(KeyError):
+            flow.unreceive(iid, str(self.root / "never.wav"))
+
+    def test_unreceive_one_of_two_keeps_the_item_received(self):
+        iid = self.r["items"][0]["id"]
+        a = flow.receive_file(iid, write_wav(self.root / "a.wav"), from_downloads=False)["files"][0]
+        flow.receive_file(iid, write_wav(self.root / "b.wav", seconds=0.3), from_downloads=False)
+        self.assertTrue(self.ctl.unreceive(iid, a))
+        st = store.load_results(self.r["batch_id"])["items"][iid]
+        self.assertEqual(st["status"], "received")
+        self.assertEqual(len(st["files"]), 1)
+        self.assertFalse(self.ctl.unreceive(iid, a))             # already gone: reported, no crash
 
     def test_cancelled_item_refuses_files(self):
         iid = self.r["items"][1]["id"]
