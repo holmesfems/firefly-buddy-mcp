@@ -1,0 +1,25 @@
+[project]
+name = "firefly-buddy-mcp"
+version = "0.1.0"
+description = "Stdio MCP server that asks the human to make sound effects in the Adobe Firefly web app (using their generative credits) through a desktop window, and picks the downloads up into the folder Claude asked for."
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.10"
+dependencies = [
+    "mcp>=1.10",
+    "pydantic>=2.6",
+    # ffmpeg for converting Firefly's audio to 16-bit PCM wav when none is on PATH
+    "imageio-ffmpeg>=0.5",
+]
+
+[project.scripts]
+firefly-buddy-mcp = "server:main"
+firefly-buddy-popup = "firefly_buddy.popup:main"
+
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+py-modules = ["server"]
+packages = ["firefly_buddy"]
